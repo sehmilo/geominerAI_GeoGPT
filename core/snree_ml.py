@@ -1,293 +1,193 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Any, List
-
 import numpy as np
 import pandas as pd
+from typing import Dict, Any, Tuple, List
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    accuracy_score,
+)
 
-import joblib
-
-from core.snree_lab import SnREEConfig, _pick_col, _safe_numeric, _normalize_col
-
-
-@dataclass
-class FeatureCols:
-    hole_id: Optional[str]
-    depth: Optional[str]
-    interval: Optional[str]
-    lat: Optional[str]
-    lon: Optional[str]
-
-    sn: Optional[str]
-    ta: Optional[str]
-    zr: Optional[str]
-    rb: Optional[str]
-    cs: Optional[str]
-    sr: Optional[str]
+EPS = 1e-9
 
 
-def detect_feature_cols(df: pd.DataFrame, cfg: SnREEConfig = SnREEConfig()) -> FeatureCols:
-    # Core IDs
-    hole_id = _pick_col(df, ("hole_id", "hole", "id", "sample_id", "sample"))
-    depth = _pick_col(df, ("depth",))
-    interval = _pick_col(df, ("interval", "INTERVAL"))
-    lat = _pick_col(df, ("lat", "latitude"))
-    lon = _pick_col(df, ("lon", "longitude", "long"))
-
-    # Chemistry (oxide or element)
-    sn = _pick_col(df, cfg.sn_candidates)
-    ta = _pick_col(df, cfg.ta_candidates)
-    zr = _pick_col(df, cfg.zr_candidates)
-    rb = _pick_col(df, cfg.rb_candidates)
-    cs = _pick_col(df, cfg.cs_candidates)
-    sr = _pick_col(df, cfg.sr_candidates)
-
-    return FeatureCols(hole_id, depth, interval, lat, lon, sn, ta, zr, rb, cs, sr)
-
-
-def build_feature_table(df: pd.DataFrame, cfg: SnREEConfig = SnREEConfig()) -> Tuple[pd.DataFrame, FeatureCols]:
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Row-level feature table for ML.
-    Keeps lat/lon and depth if present.
-    Creates fractionation proxy (Rb+Cs)/Sr.
+    Build consistent features for interval-level modeling.
+
+    Expected (if available):
+    - SnO2, Ta2O5, ZrO2, Rb2O, Cs2O, SrO, FracProxy
+    - depth_mid_m, INTERVAL
+    - hole_id, lat, lon
     """
-    cols = detect_feature_cols(df, cfg)
-    d = df.copy()
+    out = df.copy()
+    numeric_cols = ["SnO2", "Ta2O5", "ZrO2", "Rb2O", "Cs2O", "SrO", "FracProxy", "depth_mid_m"]
+    for c in numeric_cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
 
-    # Coerce numeric for chemical columns
-    for c in [cols.sn, cols.ta, cols.zr, cols.rb, cols.cs, cols.sr, cols.depth, cols.lat, cols.lon]:
-        if c and c in d.columns:
-            d[c] = _safe_numeric(d[c])
 
-    # Fractionation proxy
-    if (cols.rb or cols.cs) and cols.sr:
-        rb_vals = d[cols.rb].fillna(0) if cols.rb else 0.0
-        cs_vals = d[cols.cs].fillna(0) if cols.cs else 0.0
-        d["frac_proxy"] = (rb_vals + cs_vals) / (d[cols.sr].fillna(0) + 1e-9)
+def build_feature_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Backwards-compatible alias (some app versions import build_feature_table).
+    """
+    return build_features(df)
+
+
+def _group_split(df: pd.DataFrame, test_size: float = 0.25, seed: int = 42) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Group split by hole_id to reduce leakage.
+    """
+    if "hole_id" in df.columns:
+        groups = df["hole_id"].astype(str).fillna("NA")
     else:
-        d["frac_proxy"] = np.nan
+        groups = df.index.astype(str)
 
-    # Assemble feature frame
-    out = pd.DataFrame()
-    if cols.hole_id: out["hole_id"] = d[cols.hole_id].astype(str)
-    if cols.interval: out["interval"] = d[cols.interval]
-    if cols.depth: out["depth"] = d[cols.depth]
-    if cols.lat: out["lat"] = d[cols.lat]
-    if cols.lon: out["lon"] = d[cols.lon]
-
-    # Chemical features
-    out["sn"] = d[cols.sn] if cols.sn else np.nan
-    out["ta"] = d[cols.ta] if cols.ta else np.nan
-    out["zr"] = d[cols.zr] if cols.zr else np.nan
-    out["rb"] = d[cols.rb] if cols.rb else np.nan
-    out["cs"] = d[cols.cs] if cols.cs else np.nan
-    out["sr"] = d[cols.sr] if cols.sr else np.nan
-    out["frac_proxy"] = d["frac_proxy"]
-
-    # Clean
-    out = out.replace([np.inf, -np.inf], np.nan)
-
-    return out, cols
+    splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+    train_idx, test_idx = next(splitter.split(df, groups=groups))
+    return df.iloc[train_idx].copy(), df.iloc[test_idx].copy()
 
 
-def _label_row_rules(row: pd.Series, cfg: SnREEConfig) -> str:
+def train_baselines(
+    labeled: pd.DataFrame,
+    target_col: str = "prospectivity_class",
+    test_size: float = 0.25,
+    seed: int = 42,
+) -> Dict[str, Any]:
     """
-    Rule label per row (not p95). This makes a training target.
-    Uses fold enrichment vs median computed later.
+    Trains robust baseline classifiers:
+    - Logistic Regression (scaled, class_weight balanced)
+    - RandomForest (balanced_subsample)
+
+    Uses group split by hole_id when available.
     """
-    # Placeholder, replaced by fold-based labeling after medians computed.
-    return "Low"
+    data = labeled.dropna(subset=[target_col]).copy()
 
+    feat_cols = [c for c in ["SnO2", "Ta2O5", "ZrO2", "FracProxy", "depth_mid_m"] if c in data.columns]
+    if not feat_cols:
+        raise ValueError("No feature columns found. Need at least one of: SnO2, Ta2O5, ZrO2, FracProxy, depth_mid_m")
 
-def label_by_rules(features: pd.DataFrame, cfg: SnREEConfig = SnREEConfig()) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    """
-    Produces a labeled dataset using rule screening.
-    Uses fold vs median computed on the same dataset.
-    """
-    f = features.copy()
+    X = data[feat_cols].fillna(0.0)
+    y = data[target_col].astype(str)
 
-    med = {
-        "sn": float(np.nanmedian(f["sn"])) if f["sn"].notna().any() else 0.0,
-        "ta": float(np.nanmedian(f["ta"])) if f["ta"].notna().any() else 0.0,
-        "zr": float(np.nanmedian(f["zr"])) if f["zr"].notna().any() else 0.0,
-        "frac_proxy": float(np.nanmedian(f["frac_proxy"])) if f["frac_proxy"].notna().any() else 0.0,
-    }
+    merged = pd.concat([X, y, data.get("hole_id", pd.Series(index=data.index, dtype=str))], axis=1)
+    train_df, test_df = _group_split(merged, test_size=test_size, seed=seed)
 
-    def fold(x: float, m: float) -> float:
-        if m == 0.0:
-            return float("inf") if (x and x > 0) else 0.0
-        return float(x) / float(m)
+    X_train = train_df[feat_cols].values
+    y_train = train_df[target_col].values
+    X_test = test_df[feat_cols].values
+    y_test = test_df[target_col].values
 
-    labels: List[str] = []
-    sn_fold_list: List[float] = []
-    ta_fold_list: List[float] = []
-    zr_fold_list: List[float] = []
-    frac_fold_list: List[float] = []
+    classes_sorted = sorted(pd.unique(y).tolist())
+    models: Dict[str, Any] = {}
 
-    for _, r in f.iterrows():
-        snv = r.get("sn", np.nan)
-        tav = r.get("ta", np.nan)
-        zrv = r.get("zr", np.nan)
-        frv = r.get("frac_proxy", np.nan)
-
-        snf = fold(snv, med["sn"]) if pd.notna(snv) else 0.0
-        taf = fold(tav, med["ta"]) if pd.notna(tav) else 0.0
-        zrf = fold(zrv, med["zr"]) if pd.notna(zrv) else 0.0
-        frf = fold(frv, med["frac_proxy"]) if pd.notna(frv) else 0.0
-
-        sn_fold_list.append(snf)
-        ta_fold_list.append(taf)
-        zr_fold_list.append(zrf)
-        frac_fold_list.append(frf)
-
-        high = (
-            (snf >= cfg.high_fold and taf >= cfg.high_fold)
-            or (snf >= cfg.high_fold and frf >= cfg.high_fold)
-            or (snf >= cfg.high_fold and zrf >= cfg.high_fold)
-        )
-        medium = (
-            (snf >= cfg.medium_fold)
-            or (taf >= cfg.medium_fold)
-            or (frf >= cfg.medium_fold)
-            or (zrf >= cfg.medium_fold)
-        )
-
-        if high:
-            labels.append("High")
-        elif medium:
-            labels.append("Medium")
-        else:
-            labels.append("Low")
-
-    f["sn_fold"] = sn_fold_list
-    f["ta_fold"] = ta_fold_list
-    f["zr_fold"] = zr_fold_list
-    f["frac_fold"] = frac_fold_list
-    f["prospectivity_class"] = labels
-
-    return f, med
-
-
-def train_logreg(labeled: pd.DataFrame, test_size: float = 0.25, seed: int = 42) -> Dict[str, Any]:
-    """
-    Train a baseline logistic regression model.
-    Returns model + evaluation artifacts.
-    """
-    use_cols = ["sn", "ta", "zr", "rb", "cs", "sr", "frac_proxy", "depth"]
-    # Keep only numeric columns that exist
-    use_cols = [c for c in use_cols if c in labeled.columns]
-
-    data = labeled.dropna(subset=["prospectivity_class"]).copy()
-    X = data[use_cols].fillna(0.0)
-    y = data["prospectivity_class"].astype(str)
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=seed, stratify=y if y.nunique() > 1 else None
-    )
-
-    pipe = Pipeline([
-        ("scaler", StandardScaler(with_mean=True, with_std=True)),
-        ("clf", LogisticRegression(max_iter=2000, multi_class="auto")),
+    # Logistic Regression
+    lr = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegression(max_iter=2000, class_weight="balanced"))
     ])
+    lr.fit(X_train, y_train)
+    pred_lr = lr.predict(X_test)
 
-    pipe.fit(X_train, y_train)
-    preds = pipe.predict(X_test)
-
-    report = classification_report(y_test, preds, output_dict=True, zero_division=0)
-    cm = confusion_matrix(y_test, preds, labels=sorted(y.unique()))
-    acc = accuracy_score(y_test, preds)
-
-    return {
-        "model": pipe,
-        "features": use_cols,
-        "accuracy": float(acc),
-        "labels": sorted(y.unique()),
-        "confusion_matrix": cm,
-        "report": report,
-        "test_rows": int(len(X_test)),
+    models["logreg"] = {
+        "model": lr,
+        "accuracy": float(accuracy_score(y_test, pred_lr)),
+        "report": classification_report(y_test, pred_lr, output_dict=True, zero_division=0),
+        "confusion": confusion_matrix(y_test, pred_lr, labels=classes_sorted),
+        "features": feat_cols,
     }
 
-
-def train_xgboost(labeled: pd.DataFrame, test_size: float = 0.25, seed: int = 42) -> Dict[str, Any]:
-    """
-    Optional: XGBoost baseline.
-    Only works if xgboost is installed.
-    """
-    import xgboost as xgb
-
-    use_cols = ["sn", "ta", "zr", "rb", "cs", "sr", "frac_proxy", "depth"]
-    use_cols = [c for c in use_cols if c in labeled.columns]
-
-    data = labeled.dropna(subset=["prospectivity_class"]).copy()
-    X = data[use_cols].fillna(0.0)
-    y_str = data["prospectivity_class"].astype(str)
-
-    # Map labels to ints
-    classes = sorted(y_str.unique())
-    y = y_str.map({c: i for i, c in enumerate(classes)})
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=seed, stratify=y if y.nunique() > 1 else None
-    )
-
-    clf = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        objective="multi:softprob",
-        num_class=len(classes),
-        eval_metric="mlogloss",
+    # RandomForest
+    rf = RandomForestClassifier(
+        n_estimators=400,
         random_state=seed,
+        class_weight="balanced_subsample",
+        min_samples_leaf=2,
     )
-    clf.fit(X_train, y_train)
-    pred = clf.predict(X_test)
+    rf.fit(X_train, y_train)
+    pred_rf = rf.predict(X_test)
 
-    acc = accuracy_score(y_test, pred)
-    cm = confusion_matrix(y_test, pred, labels=list(range(len(classes))))
+    models["random_forest"] = {
+        "model": rf,
+        "accuracy": float(accuracy_score(y_test, pred_rf)),
+        "report": classification_report(y_test, pred_rf, output_dict=True, zero_division=0),
+        "confusion": confusion_matrix(y_test, pred_rf, labels=classes_sorted),
+        "features": feat_cols,
+        "feature_importance": dict(zip(feat_cols, rf.feature_importances_.tolist())),
+    }
 
     return {
-        "model": clf,
-        "features": use_cols,
-        "accuracy": float(acc),
-        "labels": classes,
-        "confusion_matrix": cm,
-        "test_rows": int(len(X_test)),
+        "n_train": int(len(X_train)),
+        "n_test": int(len(X_test)),
+        "classes": classes_sorted,
+        "models": models,
     }
 
 
-def save_model(bundle: Dict[str, Any], path: str) -> None:
-    joblib.dump(bundle, path)
-
-
-def load_model(path: str) -> Dict[str, Any]:
-    return joblib.load(path)
-
-
-def predict_ml(bundle: Dict[str, Any], features_row: pd.DataFrame) -> Tuple[str, Dict[str, float]]:
+def within_hole_prediction(
+    df: pd.DataFrame,
+    hole_col: str = "hole_id",
+    value_col: str = "SnO2",
+) -> Dict[str, Any]:
     """
-    Predict class and probabilities (if available).
+    Fit a simple depth trend per hole using interval midpoints, then predict a smooth curve.
+    Returns both:
+    - measured points (depth_mid_m, value, interval)
+    - predicted curve (depth_grid_m, predicted)
+
+    Important: This is a trend model for decision support, not a resource estimate.
     """
-    model = bundle["model"]
-    cols = bundle["features"]
-    labels = bundle["labels"]
+    out = df.copy()
 
-    X = features_row[cols].fillna(0.0)
+    if hole_col not in out.columns:
+        out[hole_col] = "HOLE"
 
-    pred = model.predict(X)[0]
+    out[value_col] = pd.to_numeric(out.get(value_col, np.nan), errors="coerce")
+    out["depth_mid_m"] = pd.to_numeric(out.get("depth_mid_m", np.nan), errors="coerce")
 
-    probs: Dict[str, float] = {}
-    if hasattr(model, "predict_proba"):
-        p = model.predict_proba(X)[0]
-        for i, lab in enumerate(labels):
-            probs[lab] = float(p[i])
+    # Unified total depth column
+    out["total_depth_m"] = pd.to_numeric(
+        out.get("total_depth_m", out.get("depth", out.get("pit_depth", out.get("total_depth", np.nan)))),
+        errors="coerce"
+    )
 
-    return str(pred), probs
+    # Interval label (optional, but helps plotting)
+    if "INTERVAL" not in out.columns:
+        out["INTERVAL"] = np.nan
+
+    results: Dict[str, Any] = {}
+
+    for hole, g in out.groupby(hole_col):
+        gg = g.dropna(subset=[value_col, "depth_mid_m"]).copy()
+        if len(gg) < 3:
+            continue
+
+        X = gg[["depth_mid_m"]].values
+        y = gg[value_col].values
+
+        reg = LinearRegression()
+        reg.fit(X, y)
+
+        td = gg["total_depth_m"].dropna()
+        max_depth = float(td.max()) if len(td) else float(np.nanmax(gg["depth_mid_m"]))
+
+        depth_grid = np.linspace(0.0, max_depth, 60).reshape(-1, 1)
+        pred = reg.predict(depth_grid)
+
+        results[str(hole)] = {
+            "measured_depth_m": gg["depth_mid_m"].tolist(),
+            "measured_value": gg[value_col].tolist(),
+            "measured_interval": gg["INTERVAL"].astype(str).tolist(),
+            "depth_grid_m": depth_grid.flatten().tolist(),
+            "predicted": pred.tolist(),
+            "n_points": int(len(gg)),
+            "max_depth_m": float(max_depth),
+        }
+
+    return results

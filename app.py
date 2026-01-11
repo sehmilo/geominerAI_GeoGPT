@@ -1,8 +1,19 @@
 import os
 import json
 import streamlit as st
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+
+import matplotlib.pyplot as plt
+from core.chemistry import ensure_oxides
+from core.snree_hotspots import hotspot_analysis
+from core.snree_ml import build_features, train_baselines, within_hole_prediction
+
+import pydeck as pdk
+import pandas as pd
+
 
 from sklearn.model_selection import train_test_split
 
@@ -13,17 +24,16 @@ from core.benchmark import run_closed_book_benchmark
 
 from core.snree_lab import (
     load_xrf_csv,
+    add_depth_interval_fields,
     summarize_xrf,
     quick_prospectivity,
     build_snree_prompt,
 )
 
 from core.snree_ml import (
-    build_feature_table,
-    label_by_rules,
-    train_logreg,
-    train_xgboost,
-    predict_ml,
+    build_features,
+    train_baselines,
+    within_hole_prediction,
 )
 
 st.set_page_config(page_title="GeoMinerAI", layout="wide")
@@ -224,36 +234,134 @@ with tab3:
 # -------------------------
 with tab4:
     st.header("Sn–REE Lab (Jos Plateau Younger Granites)")
-    st.caption("Upload XRF CSV and optionally use your PDF evidence base to generate an exploration vector, targets, maps, profiles, and ML baselines.")
+    st.caption("XRF + depth intervals + hotspot mapping + ML baselines + orientation-guided trench suggestions.")
 
     xrf_file = st.file_uploader("Upload XRF CSV", type=["csv"], key="xrf_csv")
 
-    st.subheader("Sn–REE Assessment Question")
-    snree_question = st.text_input(
+    colA, colB, colC = st.columns(3)
+    with colA:
+        oxide_mode = st.selectbox("Geochem mode", ["auto", "prefer_oxides", "elements_only"], index=0)
+    with colB:
+        hotspot_method = st.selectbox("Hotspot method", ["Gi*", "Moran", "Grid"], index=0)
+    with colC:
+        interval_choice = st.selectbox("Depth interval", ["All", "A", "B", "C", "D"], index=0)
+
+    colD, colE, colF = st.columns(3)
+    with colD:
+        hotspot_var = st.selectbox("Hotspot variable", ["SnO2", "Ta2O5", "ZrO2", "FracProxy"], index=0)
+    with colE:
+        knn_k = st.slider("k neighbors (Gi*/Moran)", 4, 20, 8, 1)
+    with colF:
+        grid_cell = st.slider("Grid cell size (m)", 100, 1000, 250, 50)
+
+    st.subheader("Exploration task")
+    snree_task = st.text_input(
         "Task",
-        value="Assess Sn–REE prospectivity from XRF results and summarize an exploration vector for follow-up work.",
-        key="snree_task"
+        value="Assess Sn–REE prospectivity from XRF and depth intervals; map hotspots; propose trench orientation and follow-up exploration vector.",
+        key="snree_task_v2"
     )
 
-    run_assessment = st.button("Run Sn–REE Assessment (v1)")
-
-    if run_assessment:
+    if st.button("Run Sn–REE Lab v2"):
         if xrf_file is None:
             st.error("Please upload an XRF CSV first.")
         else:
-            # Load and summarize XRF
             xrf_df = load_xrf_csv(xrf_file)
-            xrf_summary = summarize_xrf(xrf_df)
+
+            # Ensure oxides and compute FracProxy
+            xrf_df = ensure_oxides(
+                xrf_df,
+                prefer_existing_oxides=(oxide_mode != "elements_only"),
+                allow_element_to_oxide=(oxide_mode != "elements_only"),
+            )
+            xrf_df = add_depth_interval_fields(xrf_df, pit_depth_col="depth")
+
+            # Compute FracProxy explicitly
+            xrf_df["FracProxy"] = (pd.to_numeric(xrf_df.get("Rb2O", 0), errors="coerce").fillna(0.0)
+                                   + pd.to_numeric(xrf_df.get("Cs2O", 0), errors="coerce").fillna(0.0)) / (
+                                      pd.to_numeric(xrf_df.get("SrO", 0), errors="coerce").fillna(0.0) + 1e-6
+                                   )
+
+            # Summaries and screening
+            xrf_summary = summarize_xrf(xrf_df, oxide_mode=oxide_mode)
             rating, signals = quick_prospectivity(xrf_summary)
 
-            st.subheader("Screening Result (from XRF only)")
+            st.subheader("Rules-only screening")
             st.write({"prospectivity": rating, "signals": signals})
-            st.caption("This is a screening output. Final interpretation below uses PDFs if indexed.")
+            st.caption(xrf_summary.get("FracProxy_definition"))
+            st.caption(xrf_summary.get("FracProxy_rationale"))
 
-            # Get PDF evidence if available
+            # Interval filter
+            dd = xrf_df.copy()
+            if interval_choice != "All":
+                dd = dd[dd["INTERVAL"].astype(str).str.upper().str.strip() == interval_choice].copy()
+
+            # Hotspots
+            st.subheader("Hotspot analysis")
+            if "lat" not in dd.columns or "lon" not in dd.columns:
+                st.warning("No lat/lon columns found. Hotspot analysis requires lat and lon.")
+            else:
+                hot_df, meta = hotspot_analysis(
+                    dd.dropna(subset=["lat", "lon"]),
+                    value_col=hotspot_var,
+                    method=hotspot_method,
+                    k=int(knn_k),
+                    grid_cell_m=float(grid_cell),
+                    z_thresh=1.0,
+                )
+                st.write(meta)
+
+                # Map using pydeck with cluster-based colors
+                def color_for_cluster(c: str):
+                    c = str(c)
+                    if c in ["Hot", "HH", "High"]:
+                        return [200, 30, 30, 160]
+                    if c in ["Cold", "LL", "Low"]:
+                        return [30, 30, 200, 160]
+                    if c in ["Medium"]:
+                        return [240, 180, 30, 160]
+                    if c in ["Outlier"]:
+                        return [150, 30, 150, 160]
+                    return [90, 90, 90, 120]
+
+                hot_df["_color"] = hot_df["cluster"].apply(color_for_cluster)
+
+                layer = pdk.Layer(
+                    "ScatterplotLayer",
+                    data=hot_df,
+                    get_position=["lon", "lat"],
+                    get_fill_color="_color",
+                    get_radius=35,
+                    pickable=True,
+                )
+                view = pdk.ViewState(
+                    latitude=float(hot_df["lat"].mean()),
+                    longitude=float(hot_df["lon"].mean()),
+                    zoom=11,
+                )
+                deck = pdk.Deck(layers=[layer], initial_view_state=view, tooltip={"text": "{cluster}\n" + hotspot_var + ": {" + hotspot_var + "}"})
+                st.pydeck_chart(deck)
+
+                # Show labeled table for decisions
+                cols = ["hole_id", "INTERVAL", "lat", "lon", hotspot_var, "cluster", "method"]
+                cols = [c for c in cols if c in hot_df.columns]
+                st.dataframe(hot_df[cols].head(200), use_container_width=True)
+
+
+                # Orientation and trench azimuth
+                orient = meta.get("orientation", {})
+                if orient.get("trend_azimuth_deg") is not None:
+                    st.success(
+                        f"Inferred mineralization trend azimuth: {orient['trend_azimuth_deg']:.1f}° | "
+                        f"Recommended trench azimuth (perpendicular): {orient['trench_azimuth_deg']:.1f}° "
+                        f"(based on {orient.get('n_high', 0)} high-cluster points)"
+                    )
+                else:
+                    st.info("Not enough high-cluster points to infer a stable trend. Add more samples or use Grid binning.")
+
+            # Build evidence if PDFs are indexed
             evidence = []
             if st.session_state.index is not None:
-                evidence = retrieve(snree_question, st.session_state.index, st.session_state.chunks, k=6)
+                evidence = retrieve(snree_task, st.session_state.index, st.session_state.chunks, k=6)
 
             st.subheader("Evidence used (PDF snippets)")
             if evidence:
@@ -262,186 +370,126 @@ with tab4:
                     st.write(h["text"])
                     st.divider()
             else:
-                st.info("No PDF index found or no evidence retrieved. Build the PDF index in the sidebar if you want cited geological context.")
+                st.info("No PDF evidence used. Build the PDF index in the sidebar to enable citations.")
 
-            # Build Sn–REE prompt and call model
-            prompt = build_snree_prompt(
-                question=snree_question,
-                xrf_summary=xrf_summary,
-                evidence=evidence,
-                prospectivity=rating,
-                signals=signals,
-            )
+            # ML baselines
+            st.subheader("ML baselines (experimental)")
+            feat_df = build_features(xrf_df)
 
-            st.subheader("Sn–REE Lab Output (LLM)")
-            with st.spinner("Generating Sn–REE interpretation..."):
-                out = generate_from_prompt(prompt, model=hf_model, provider=provider)
-            st.write(out)
+            # Choose a label source for training, for now use rules-only label per row as baseline
+            # Later you can switch to field labels when you have them
+            # Simple per-row rule label: compare to global quantiles
+            sn = pd.to_numeric(feat_df.get("SnO2", np.nan), errors="coerce")
+            q1 = sn.quantile(0.33)
+            q2 = sn.quantile(0.66)
 
-            st.subheader("XRF Summary Preview")
-            st.json(xrf_summary)
+            def sn_label(v):
+                if pd.isna(v):
+                    return np.nan
+                if v <= q1:
+                    return "Low"
+                if v <= q2:
+                    return "Medium"
+                return "High"
 
-    st.divider()
-    st.subheader("Sn–REE Lab v2: Targets, Maps, Depth Profiles, and ML Baselines")
+            feat_df["prospectivity_class"] = sn.apply(sn_label)
 
-    if xrf_file is None:
-        st.info("Upload the XRF CSV above to enable Sn–REE Lab v2.")
-    else:
-        # Reload fresh for v2 block
-        xrf_df = load_xrf_csv(xrf_file)
+            bundle = train_baselines(feat_df, target_col="prospectivity_class", test_size=0.25, seed=42)
+            st.write({"n_train": bundle["n_train"], "n_test": bundle["n_test"], "classes": bundle["classes"]})
 
-        feat_df, feat_cols = build_feature_table(xrf_df)
-        labeled_df, medians = label_by_rules(feat_df)
+            for name, info in bundle["models"].items():
+                st.markdown(f"### Model: {name}")
+                st.write({"accuracy": info["accuracy"], "features": info["features"]})
+                if "feature_importance" in info:
+                    st.write({"feature_importance": info["feature_importance"]})
 
-        st.write("Detected columns:", feat_cols)
-        st.write("Label medians (used for fold):", medians)
+            # Within-hole prediction
+            st.subheader("Within-hole depth profile (measured points + predicted curve)")
+            st.caption("Depth increases downward. Shaded bands show A/B/C/D intervals.")
 
-        # 1) Labeled training table
-        st.subheader("1) Labeled training table (features -> prospectivity_class)")
-        st.dataframe(labeled_df.head(25), use_container_width=True)
+            # Let user choose what variable to profile
+            profile_var = st.selectbox("Profile variable", ["SnO2", "Ta2O5", "FracProxy", "ZrO2"], index=0)
 
-        csv_labeled = labeled_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download labeled training table CSV",
-            data=csv_labeled,
-            file_name="snree_labeled_training_table.csv",
-            mime="text/csv",
-        )
+            if "hole_id" in xrf_df.columns:
+                preds = within_hole_prediction(xrf_df, hole_col="hole_id", value_col=profile_var)
 
-        # 2) Map hotspots
-        st.subheader("2) Hotspot map (lat/lon)")
-        if "lat" in labeled_df.columns and "lon" in labeled_df.columns and labeled_df["lat"].notna().any() and labeled_df["lon"].notna().any():
-            map_df = labeled_df.dropna(subset=["lat", "lon"]).copy()
-            st.map(map_df.rename(columns={"lat": "latitude", "lon": "longitude"})[["latitude", "longitude"]])
-            st.caption("This is a basic point map. If you want class colors and legend, we can add PyDeck next.")
-        else:
-            st.info("No usable lat/lon detected for mapping. Ensure columns exist (lat, lon).")
+                if not preds:
+                    st.info("Not enough points per hole to fit a depth trend (need at least 3 interval samples in a hole).")
+                else:
+                    hole_list = sorted(list(preds.keys()))
+                    selected_hole = st.selectbox("Select hole", options=hole_list, index=0)
 
-        # 3) Depth profiles per hole_id
-        st.subheader("3) Depth profiles per hole_id")
-        can_profile = ("hole_id" in labeled_df.columns) and ("depth" in labeled_df.columns) and labeled_df["depth"].notna().any()
+                    p = preds[selected_hole]
 
-        if can_profile:
-            hole_ids = sorted(labeled_df["hole_id"].dropna().unique().tolist())
-            hole = st.selectbox("Select hole_id", options=hole_ids)
+                    # Build measured table for plotting
+                    meas_tbl = pd.DataFrame({
+                        "depth_mid_m": p["measured_depth_m"],
+                        "value": p["measured_value"],
+                        "INTERVAL": p.get("measured_interval", [""] * len(p["measured_depth_m"])),
+                    }).sort_values("depth_mid_m")
 
-            hdf = labeled_df[labeled_df["hole_id"] == hole].dropna(subset=["depth"]).sort_values("depth")
+                    # Interval colors (consistent, geology-friendly)
+                    interval_colors = {
+                        "A": "tab:green",
+                        "B": "tab:orange",
+                        "C": "tab:blue",
+                        "D": "tab:red",
+                    }
 
-            metric = st.selectbox("Profile metric", options=["sn", "ta", "zr", "frac_proxy", "sn_fold", "ta_fold", "priority_score"] if "priority_score" in labeled_df.columns else ["sn", "ta", "zr", "frac_proxy", "sn_fold", "ta_fold"])
+                    def norm_interval(s: str) -> str:
+                        s2 = str(s).strip().upper()
+                        return s2 if s2 in interval_colors else "NA"
 
-            fig = plt.figure()
-            ax = fig.add_subplot(111)
-            ax.plot(hdf[metric].fillna(0), hdf["depth"])
-            ax.set_xlabel(metric)
-            ax.set_ylabel("depth")
-            ax.invert_yaxis()
-            st.pyplot(fig)
-        else:
-            st.info("Depth profile not available. Ensure columns exist: hole_id and depth.")
+                    meas_tbl["INTERVAL_N"] = meas_tbl["INTERVAL"].apply(norm_interval)
 
-        # 4) Priority drilling targets table
-        st.subheader("4) Priority targets table (ranked)")
-        targets = labeled_df.copy()
+                    fig = plt.figure()
+                    ax = fig.add_subplot(111)
 
-        targets["priority_score"] = (
-            targets.get("sn_fold", 0).fillna(0) * 0.50
-            + targets.get("ta_fold", 0).fillna(0) * 0.25
-            + targets.get("zr_fold", 0).fillna(0) * 0.15
-            + targets.get("frac_fold", 0).fillna(0) * 0.10
-        )
+                    # Optional upgrade: shaded depth bands for A/B/C/D
+                    # A: 0-0.3, B: 0.3-1.0, C: 1.0-2.0, D: 2.0-max_depth
+                    maxd = float(p["max_depth_m"])
+                    bands = [
+                        ("A", 0.0, min(0.3, maxd)),
+                        ("B", 0.3, min(1.0, maxd)),
+                        ("C", 1.0, min(2.0, maxd)),
+                        ("D", 2.0, maxd),
+                    ]
 
-        topN = st.slider("How many targets to show", min_value=10, max_value=200, value=30, step=10)
-        show_cols = [c for c in ["hole_id", "depth", "interval", "sn", "ta", "zr", "frac_proxy", "sn_fold", "ta_fold", "priority_score", "prospectivity_class"] if c in targets.columns]
+                    for name, y0, y1 in bands:
+                        if y1 > y0:
+                            ax.axhspan(y0, y1, alpha=0.08)
+                            ax.text(
+                                x=0.01, y=(y0 + y1) / 2.0,
+                                s=name,
+                                transform=ax.get_yaxis_transform(),
+                                va="center",
+                                fontsize=9
+                            )
 
-        ranked = targets.sort_values("priority_score", ascending=False).head(int(topN))
-        st.dataframe(ranked[show_cols], use_container_width=True)
+                    # Predicted curve
+                    ax.plot(p["predicted"], p["depth_grid_m"], label="Predicted trend", linewidth=2)
 
-        # 5) Train baseline ML model
-        st.subheader("5) Baseline ML training and comparison")
+                    # Measured points colored by interval
+                    for iv, g in meas_tbl.groupby("INTERVAL_N"):
+                        if iv in interval_colors:
+                            ax.scatter(g["value"], g["depth_mid_m"], label=f"Measured {iv}", s=55)
+                        else:
+                            ax.scatter(g["value"], g["depth_mid_m"], label="Measured (unlabeled)", s=55)
 
-        algo = st.selectbox("Choose model", options=["Logistic Regression", "XGBoost (optional)"])
-        test_size = st.slider("Test split", 0.1, 0.5, 0.25, 0.05)
-        seed = st.number_input("Seed", value=42, step=1)
+                    ax.set_xlabel(f"{profile_var} (same units as your CSV)")
+                    ax.set_ylabel("Depth (m)")
+                    ax.invert_yaxis()
+                    ax.grid(True)
+                    ax.legend(loc="best")
 
-        if st.button("Train ML model"):
-            if algo == "Logistic Regression":
-                bundle = train_logreg(labeled_df, test_size=float(test_size), seed=int(seed))
-                st.session_state.snree_ml_bundle = bundle
+                    st.pyplot(fig, clear_figure=True)
+
+                    # Clean table (no JSON)
+                    st.dataframe(
+                        meas_tbl[["depth_mid_m", "INTERVAL", "value"]].rename(columns={"value": f"{profile_var}_measured"}),
+                        use_container_width=True
+                    )
+
             else:
-                try:
-                    bundle = train_xgboost(labeled_df, test_size=float(test_size), seed=int(seed))
-                    st.session_state.snree_ml_bundle = bundle
-                except Exception as e:
-                    st.error(f"XGBoost failed. Install xgboost or use Logistic Regression. Error: {type(e).__name__}: {e}")
-                    st.session_state.snree_ml_bundle = None
+                st.info("No hole_id column found. Add hole_id to enable within-hole profiling.")
 
-            if st.session_state.snree_ml_bundle is not None:
-                b = st.session_state.snree_ml_bundle
-                st.success(f"Trained. Accuracy: {b['accuracy']:.3f} on {b['test_rows']} test rows.")
-                st.write("Features used:", b["features"])
-                st.write("Labels:", b["labels"])
-                st.write("Confusion matrix:")
-                st.write(b["confusion_matrix"])
-                if "report" in b:
-                    st.write("Classification report (dict):")
-                    st.json(b["report"])
-
-        # 6) Compare rules-only vs ML-only vs ML + LLM explanation
-        st.subheader("6) Compare: rules-only vs ML-only vs ML + LLM explanation")
-
-        if st.session_state.snree_ml_bundle is None:
-            st.info("Train the ML model first.")
-        else:
-            b = st.session_state.snree_ml_bundle
-
-            idx = st.number_input(
-                "Row index to inspect (0-based index in labeled table)",
-                min_value=0,
-                max_value=int(len(labeled_df) - 1),
-                value=0,
-                step=1,
-            )
-
-            row = labeled_df.iloc[[int(idx)]].copy()
-            rules_pred = str(row["prospectivity_class"].iloc[0])
-            ml_pred, ml_probs = predict_ml(b, row)
-
-            st.write({"rules_only": rules_pred, "ml_only": ml_pred, "ml_probs": ml_probs})
-
-            if st.button("Generate ML + LLM explanation"):
-                explain_task = (
-                    "Explain why this sample/interval is classified as the given prospectivity class for a Jos Plateau Younger Granite Sn–Nb–Ta system. "
-                    "Use the numeric features provided. If PDFs are available, cite them. If not, state that reasoning is based on XRF only."
-                )
-
-                ev = []
-                if st.session_state.index is not None:
-                    ev = retrieve(explain_task, st.session_state.index, st.session_state.chunks, k=4)
-
-                feature_view = row[b["features"]].fillna(0.0).to_dict(orient="records")[0]
-
-                prompt_lines = []
-                prompt_lines.append("You are GeoMinerAI Sn–REE Lab v2, an exploration geologist assistant.")
-                prompt_lines.append("Context: Jos Plateau Younger Granites. Be factual. Do not invent.")
-                prompt_lines.append("")
-                prompt_lines.append("Given:")
-                prompt_lines.append(f"- Rules-only class: {rules_pred}")
-                prompt_lines.append(f"- ML-only class: {ml_pred}")
-                prompt_lines.append(f"- ML probabilities: {ml_probs}")
-                prompt_lines.append(f"- Features: {feature_view}")
-                prompt_lines.append("")
-                prompt_lines.append("PDF Evidence (if any):")
-                for i2, e in enumerate(ev, 1):
-                    prompt_lines.append(f"[S{i2}] {e['source']} (page {e['page']}): {e['text']}")
-                prompt_lines.append("")
-                prompt_lines.append("Write a short explanation with headings:")
-                prompt_lines.append("1) Decision summary")
-                prompt_lines.append("2) Key geochemical drivers (from features)")
-                prompt_lines.append("3) Geological context (cite PDFs if present)")
-                prompt_lines.append("4) What to do next")
-
-                prompt = "\n".join(prompt_lines)
-
-                with st.spinner("Generating explanation..."):
-                    explanation = generate_from_prompt(prompt, model=hf_model, provider=provider)
-                st.write(explanation)
