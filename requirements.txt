@@ -16,3 +16,6 @@ huggingface-hub>=0.34,<1.0
 pypdf>=4.2,<5.0
 faiss-cpu>=1.8,<2.0
 xgboost>=2.0,<3.0
+pydeck>=0.9,<1.0
+folium>=0.15.0
+streamlit-folium>=0.18.0
