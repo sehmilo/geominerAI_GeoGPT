@@ -33,7 +33,7 @@ from core.snree_ml import build_features, train_baselines, within_hole_predictio
 
 
 # -----------------------------
-# Small GIS helpers
+# GIS helpers
 # -----------------------------
 def haversine_m(lat1, lon1, lat2, lon2):
     R = 6371000.0
@@ -58,8 +58,8 @@ def nearest_row_by_click(df, click_lat, click_lon, lat_col="lat", lon_col="lon")
 # -----------------------------
 st.set_page_config(page_title="GeoMinerAI", layout="wide")
 
-st.title("GeoMinerAI")
-st.caption("Upload geoscience PDFs, retrieve evidence, and answer with citations using a Hugging Face model.")
+st.title("geoMinerAI")
+st.caption("Upload geoscience PDFs, field note and report, retrieve evidence, and answer with citations using a Hugging Face model.")
 
 # Session state
 if "index" not in st.session_state:
@@ -111,10 +111,10 @@ with st.sidebar:
     st.caption("Local: .streamlit/secrets.toml. Online: set HF_TOKEN in Streamlit Cloud Secrets.")
 
     st.divider()
-    st.header("PDF knowledge base (RAG)")
+    st.header("Knowledge base (RAG)")
     pdfs = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
 
-    if st.button("Build PDF Index"):
+    if st.button("Build Knowledge Index"):
         if not pdfs:
             st.error("Upload at least one PDF.")
         else:
@@ -174,7 +174,7 @@ with tab1:
         else:
             hits = retrieve(q, st.session_state.index, st.session_state.chunks, k=5)
 
-            st.subheader("Evidence (from your PDFs)")
+            st.subheader("Evidence (from your Knowlegde Box)")
             for i, h in enumerate(hits, 1):
                 st.markdown(f"**[S{i}] {h['source']} | page {h['page']}**")
                 st.write(h["text"])
@@ -186,7 +186,7 @@ with tab1:
             st.write(final)
 
     st.info(
-        "Real data needed here: upload real geology PDFs. "
+        "Real data needed here: upload open source geology PDFs or materials you have license to use."
         "GeoGPT-CoT-QA is used in the Benchmark and SFT Export tabs."
     )
 
@@ -319,7 +319,7 @@ with tab4:
     )
 
     # IMPORTANT: compute only on button click, store in session_state
-    run = st.button("Run Sn–REE Lab v2", key="snree_run")
+    run = st.button("Run Sn–REE Lab", key="snree_run")
 
     if run:
         if xrf_file is None:
