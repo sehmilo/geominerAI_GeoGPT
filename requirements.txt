@@ -19,3 +19,10 @@ xgboost>=2.0,<3.0
 pydeck>=0.9,<1.0
 folium>=0.15.0
 streamlit-folium>=0.18.0
+
+# Multi-format knowledge base ingestion
+python-docx>=1.1,<2.0
+Pillow>=10.0,<12.0
+
+# Spatial / geoprocessing
+shapely>=2.0,<3.0
