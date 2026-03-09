@@ -125,3 +125,30 @@ def generate_from_prompt(prompt: str, model: str, provider: str = "auto", max_ne
             return str(getattr(msg, "content", "")).strip()
         except Exception as e2:
             return f"HF inference failed. Error 1: {type(e1).__name__}: {e1} Error 2: {type(e2).__name__}: {e2}"
+
+
+def generate_streaming(prompt: str, model: str, provider: str = "auto",
+                       max_new_tokens: int = 650, temperature: float = 0.2):
+    """Generator that yields tokens one-by-one for SSE streaming."""
+    token = _get_hf_token()
+    if not token:
+        yield "HF token missing."
+        return
+
+    client = InferenceClient(model=model, token=token, provider=provider)
+
+    try:
+        for chunk in client.text_generation(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            return_full_text=False,
+            stream=True,
+        ):
+            text = chunk if isinstance(chunk, str) else str(chunk)
+            yield text
+    except Exception:
+        # Fallback to non-streaming
+        result = generate_from_prompt(prompt, model=model, provider=provider,
+                                      max_new_tokens=max_new_tokens, temperature=temperature)
+        yield result
